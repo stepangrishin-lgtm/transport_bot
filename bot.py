@@ -1,4 +1,3 @@
-# bot.py (version 0.3) — SQLite storage, weighted average (recent marks have higher weight)
 import os
 import json
 import asyncio
@@ -13,176 +12,214 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ---------------- CONFIG ----------------
-# Укажи свой токен
-BOT_TOKEN = "8598055235:AAEcMaVgBkiKYokFXxDd2_govw4ytGp8Rn4"
+# ------------- CONFIG -------------
+BOT_TOKEN = "8598055235:AAEcMaVgBkiKYokFXxDd2_govw4ytGp8Rn4"  # <-- сюда вставь свой токен
 
-# Файлы
-SCHEDULE_FILE = "schedule.json"   # файл с расписанием (см. ранее)
-STATE_FILE = "state.json"         # для хранения последних сообщений с кнопками
-DB_FILE = "transport.db"          # sqlite база для отметок
+SCHEDULE_FILE = "schedule.json"
+DB_FILE = "transport.db"
 
-# Сессии нажатий: user_id -> (pressed_ts, expiry_ts)
+SESSION_TTL = 180  # секунды, сколько живёт "сессия нажатия"
+
+# В памяти: последние два сообщения с кнопками
+LAST_BUTTON_MESSAGES: List[Tuple[int, int]] = []
+
+# В памяти: user_id -> (pressed_ts, expiry_ts)
 PRESSED_SESSIONS: Dict[int, Tuple[int, int]] = {}
-SESSION_TTL = 180  # seconds
 
-# aiogram bot init (3.7+)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ---------------- Utilities: schedule & state ----------------
+
+# ------------- Время и расписание -------------
+def now_local() -> datetime:
+    # считаем, что системное время Windows уже в Москве
+    return datetime.now()
+
+
 def load_schedule() -> List[Dict]:
     if not os.path.exists(SCHEDULE_FILE):
-        raise RuntimeError(f"Schedule file '{SCHEDULE_FILE}' not found. Create it (see docs).")
+        raise RuntimeError(f"Файл расписания '{SCHEDULE_FILE}' не найден.")
     with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     stops = data.get("stops", [])
-    # add order index if not present
-    for idx, s in enumerate(stops):
-        s.setdefault("order", idx)
+    for s in stops:
+        s["id"] = int(s["id"])
     return stops
 
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
 
-def save_state(obj: dict):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+SCHEDULE: List[Dict] = load_schedule()
 
-# ---------------- DB layer ----------------
+
+def schedule_map_dt() -> Dict[int, datetime]:
+    """stop_id -> плановое время (сегодня, локальное)."""
+    today = now_local().date()
+    result: Dict[int, datetime] = {}
+    for s in SCHEDULE:
+        h, m = map(int, s["time"].split(":"))
+        dt = datetime(
+            year=today.year,
+            month=today.month,
+            day=today.day,
+            hour=h,
+            minute=m,
+        )
+        result[s["id"]] = dt
+    return result
+
+
+# ------------- БД -------------
 def init_db():
-    need = not os.path.exists(DB_FILE)
-    conn = sqlite3.connect(DB_FILE, isolation_level=None)
+    need_new = not os.path.exists(DB_FILE)
+    conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stop_id INTEGER NOT NULL,
             timestamp INTEGER NOT NULL,
             user_id INTEGER
         )
-    """)
+        """
+    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_stop ON events(stop_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(timestamp)")
     conn.commit()
     conn.close()
-    return need
+    return need_new
+
 
 def add_event(stop_id: int, ts: int, user_id: Optional[int] = None):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("INSERT INTO events (stop_id, timestamp, user_id) VALUES (?, ?, ?)", (stop_id, int(ts), user_id))
+    cur.execute(
+        "INSERT INTO events (stop_id, timestamp, user_id) VALUES (?, ?, ?)",
+        (int(stop_id), int(ts), user_id),
+    )
     conn.commit()
     conn.close()
 
-def get_today_events() -> List[Tuple[int,int]]:
-    """Return list of (stop_id, timestamp) for today's events (UTC)"""
+
+def get_today_events() -> List[Tuple[int, int]]:
+    """Список (stop_id, timestamp) за текущий календарный день (по локальному времени)."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    now = datetime.utcnow()
-    start_of_day = datetime(now.year, now.month, now.day, 0, 0, 0)
+    now = now_local()
+    start_of_day = datetime(
+        year=now.year,
+        month=now.month,
+        day=now.day,
+        hour=0,
+        minute=0,
+        second=0,
+    )
     start_ts = int(start_of_day.timestamp())
-    cur.execute("SELECT stop_id, timestamp FROM events WHERE timestamp >= ?", (start_ts,))
+    cur.execute(
+        "SELECT stop_id, timestamp FROM events WHERE timestamp >= ? ORDER BY timestamp ASC",
+        (start_ts,),
+    )
     rows = cur.fetchall()
     conn.close()
-    return rows
+    return [(int(sid), int(ts)) for sid, ts in rows]
+
 
 def get_events_by_stop_today() -> Dict[int, List[int]]:
-    rows = get_today_events()
+    events = get_today_events()
     d: Dict[int, List[int]] = {}
-    for sid, ts in rows:
-        d.setdefault(int(sid), []).append(int(ts))
+    for sid, ts in events:
+        d.setdefault(sid, []).append(ts)
     return d
 
-# ---------------- UI helpers: main menu & button lifecycle ----------------
-def main_menu_builder() -> InlineKeyboardBuilder:
+
+# ------------- UI: главное меню + очистка клавиатур -------------
+def main_menu_markup() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📍 Где автобус?", callback_data="where")
     kb.button(text="🚌 Отметить прибытие", callback_data="press")
     kb.adjust(1)
-    return kb
+    return kb.as_markup()
 
-async def remove_buttons_async(chat_id: int, message_id: int):
-    try:
-        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
-    except Exception:
-        # ignore if message removed or other error
-        pass
-    
-    async def register_buttons_message_async(chat_id: int, message_id: int):state = load_state()
-    last = state.get("last_buttons", [])
-    last.append({"chat_id": chat_id, "message_id": message_id})
-    # keep only last two; remove reply_markup for older
-    while len(last) > 2:
-        old = last.pop(0)
-        await remove_buttons_async(old["chat_id"], old["message_id"])
-    state["last_buttons"] = last
-    save_state(state)
 
-# ---------------- Schedule helpers ----------------
-SCHEDULE = load_schedule()  # list of dicts with id, name, time ("HH:MM"), optional order
-
-def parse_sched_dt(timestr: str, ref_date: datetime) -> datetime:
-    h,m = map(int, timestr.split(":"))
-    return datetime(year=ref_date.year, month=ref_date.month, day=ref_date.day, hour=h, minute=m)
-
-def schedule_map_dt() -> Dict[int, datetime]:
-    today = datetime.utcnow().date()
-    sm = {}
-    for s in SCHEDULE:
-        sm[s["id"]] = parse_sched_dt(s["time"], today)
-    return sm
-
-# ---------------- Weighted average logic (variant B) ----------------
-def compute_weighted_offset_seconds() -> Tuple[float, int]:
+async def register_buttons_message(chat_id: int, message_id: int):
     """
-    Compute global offset (seconds) to apply to schedule.
-    Weighted by recency: for events sorted by timestamp ascending,
-    weight = 1..n (last event has highest weight).
-    Returns (offset_seconds, total_reports)
-    Each event's contribution: (event_ts - schedule_ts_of_its_stop) * weight
+    Оставляем клавиатуру только у двух последних сообщений.
     """
-    events_by_stop = get_events_by_stop_today()  # {stop_id: [ts,...]}
-    # flatten events to list of (ts, stop_id)
-    flat: List[Tuple[int,int]] = []
-    for sid, timestamps in events_by_stop.items():
-        for ts in timestamps:
-            flat.append((ts, sid))
+    global LAST_BUTTON_MESSAGES
+    LAST_BUTTON_MESSAGES.append((chat_id, message_id))
+
+    while len(LAST_BUTTON_MESSAGES) > 2:
+        old_chat_id, old_msg_id = LAST_BUTTON_MESSAGES.pop(0)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=old_chat_id,
+                message_id=old_msg_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+
+async def send_with_main_menu_from_message(message: Message, text: str):
+    msg = await message.answer(text, reply_markup=main_menu_markup())
+    await register_buttons_message(msg.chat.id, msg.message_id)
+
+
+async def send_with_main_menu_from_callback(callback: CallbackQuery, text: str):
+    msg = await callback.message.answer(text, reply_markup=main_menu_markup())
+    await register_buttons_message(msg.chat.id, msg.message_id)
+
+
+# ------------- Взвешенное среднее отклонение (вариант B) -------------
+def compute_weighted_offset_seconds() -> Tuple[float, int, Optional[float]]:
+    """
+    Глобальное смещение (секунды) между фактами и расписанием.
+    Новые отметки весомее старых.
+
+    Возвращает:
+      offset_seconds,
+      total_reports,
+      latest_event_age_minutes
+    """
+    events_by_stop = get_events_by_stop_today()
+    flat: List[Tuple[int, int]] = []
+    for sid, ts_list in events_by_stop.items():
+        for ts in ts_list:
+            flat.append((int(ts), int(sid)))
+
     if not flat:
-        return 0.0, 0
-    # sort by ts ascending
+        return 0.0, 0, None
+
     flat.sort(key=lambda x: x[0])
-    total = 0.0
-    weight_sum = 0.0
-    # compute schedule dt map
     sched_map = schedule_map_dt()
-    n = len(flat)
-    # assign weights 1..n (older smaller, recent larger)
+
+    total_weighted_delta = 0.0
+    weight_sum = 0.0
+
     for idx, (ts, sid) in enumerate(flat, start=1):
-        weight = idx  # simple linear weights; last gets n
-        event_dt = datetime.utcfromtimestamp(ts)
+        weight = idx
+        event_dt = datetime.fromtimestamp(ts)
         sched_dt = sched_map.get(sid)
         if sched_dt is None:
-            # if schedule missing, skip
             continue
-        delta = (event_dt - sched_dt).total_seconds()
-        total += delta * weight
+        delta_sec = (event_dt - sched_dt).total_seconds()
+        total_weighted_delta += delta_sec * weight
         weight_sum += weight
-    if weight_sum == 0:
-        return 0.0, len(flat)
-    offset = total / weight_sum
-    return offset, len(flat)
 
-# ---------------- Confidence metric ----------------
+    if weight_sum == 0:
+        offset_sec = 0.0
+    else:
+        offset_sec = total_weighted_delta / weight_sum
+
+    latest_ts = flat[-1][0]
+    latest_age_min = (now_local().timestamp() - latest_ts) / 60.0
+
+    return offset_sec, len(flat), latest_age_min
+
+
 def compute_confidence(report_count: int, latest_event_age_minutes: Optional[float]) -> int:
-    # base by number of reports
     if report_count == 0:
-        return 30
-    pct = min(95, 40 + report_count * 5)  # e.g., 10 reports -> 90
+        return 40
+    pct = min(95, 40 + report_count * 5)
     if latest_event_age_minutes is not None:
         if latest_event_age_minutes > 60:
             pct = int(pct * 0.6)
@@ -190,63 +227,52 @@ def compute_confidence(report_count: int, latest_event_age_minutes: Optional[flo
             pct = int(pct * 0.8)
     return int(pct)
 
-# ---------------- Build ETA and prepare window (5 stops, key 3rd) ----------------
-def build_eta_and_window() -> Tuple[List[Dict], int, str]:
-    """
-    Returns:
-      window_list: list of dicts for chosen 5 stops: {id, name, eta_dt, eta_str, is_key}
-      confidence_pct
-      status_text ("опаздывает", "спешит", "в графике")
-    """
-    offset_seconds, total_reports = compute_weighted_offset_seconds()
-    # compute latest event time for age
-    events = get_today_events()
-    latest_ts = max([ts for (_,ts) in events]) if events else None
-    latest_age_min = None
-    if latest_ts:
-        latest_age_min = (int(datetime.utcnow().timestamp()) - latest_ts) / 60.0
 
-    conf = compute_confidence(total_reports, latest_age_min)
+# ------------- Построение ETA и окна из 5 остановок -------------
+def build_eta_window() -> Tuple[List[Dict], int, str]:
+    """
+    Строим ETA (по расписанию + глобальное смещение),
+    выбираем окно из 5 остановок, где ключевая ближе всего к текущему времени.
+    """
+    offset_sec, report_count, latest_age_min = compute_weighted_offset_seconds()
+    confidence = compute_confidence(report_count, latest_age_min)
 
-    # schedule map
     sched_map = schedule_map_dt()
-    # build eta map: schedule + offset
-    eta_map_dt: Dict[int, datetime] = {}
+    eta_map: Dict[int, datetime] = {}
     for s in SCHEDULE:
         sid = s["id"]
         sched_dt = sched_map[sid]
-        eta_dt = sched_dt + timedelta(seconds=offset_seconds)
-        eta_map_dt[sid] = eta_dt
+        eta_map[sid] = sched_dt + timedelta(seconds=offset_sec)
 
-    # determine key stop (closest ETA to now)
-    ref_ts = datetime.utcnow()
-    diffs = [(sid, abs((eta_map_dt[sid] - ref_ts).total_seconds())) for sid in eta_map_dt.keys()]
-    diffs_sorted = sorted(diffs, key=lambda x: x[1])
-    key_sid = diffs_sorted[0][0]
+    now = now_local()
+    diffs = [(sid, abs((eta - now).total_seconds())) for sid, eta in eta_map.items()]
+    diffs.sort(key=lambda x: x[1])
+    key_sid = diffs[0][0] if diffs else SCHEDULE[0]["id"]
 
-    # find key index in schedule ordering
     ids_ordered = [s["id"] for s in SCHEDULE]
-    idx_key = ids_ordered.index(key_sid)
-    start = max(0, idx_key - 2)
+    key_index = ids_ordered.index(key_sid)
+    start = max(0, key_index - 2)
     end = start + 5
     if end > len(ids_ordered):
         end = len(ids_ordered)
         start = max(0, end - 5)
-    chosen_ids = ids_ordered[start:end]
-    window = []
-    for i, sid in enumerate(chosen_ids):
-        s = next(x for x in SCHEDULE if x["id"] == sid)
-        eta_dt = eta_map_dt[sid]
-        window.append({
-            "id": sid,
-            "name": s["name"],
-            "eta_dt": eta_dt,
-            "eta_str": eta_dt.strftime("%H:%M"),
-            "is_key": (sid == key_sid)
-        })
 
-    # status_text based on average offset (minutes)
-    avg_offset_min = offset_seconds / 60.0
+    chosen_ids = ids_ordered[start:end]
+
+    window: List[Dict] = []
+    for sid in chosen_ids:
+        stop = next(s for s in SCHEDULE if s["id"] == sid)
+        eta_dt = eta_map[sid]
+        window.append(
+            {
+                "id": sid,"name": stop["name"],
+                "eta_dt": eta_dt,
+                "eta_str": eta_dt.strftime("%H:%M"),
+                "is_key": sid == key_sid,
+            }
+        )
+
+    avg_offset_min = offset_sec / 60.0
     if avg_offset_min > 1.5:
         status = f"автобус опаздывает на {int(round(avg_offset_min))} мин."
     elif avg_offset_min < -1.5:
@@ -254,98 +280,119 @@ def build_eta_and_window() -> Tuple[List[Dict], int, str]:
     else:
         status = "автобус идёт по расписанию"
 
-    return window, conf, status
+    return window, confidence, status
 
-# ---------------- Handlers ----------------
+
+# ------------- Хэндлеры -------------
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    kb = main_menu_builder()
-    msg = await message.answer("Привет! Бот транспорта (v0.3). Выберите действие:", reply_markup=kb.as_markup())
-    await register_buttons_message_async(msg.chat.id, msg.message_id)
+async def on_start(message: Message):
+    await send_with_main_menu_from_message(
+        message,
+        "Привет! Бот транспорта (v0.3.2). Выберите действие:",
+    )
+
 
 @dp.callback_query(F.data == "where")
-async def cb_where(callback: CallbackQuery):
-    window, conf, status = build_eta_and_window()
+async def on_where(callback: CallbackQuery):
+    window, confidence, status = build_eta_window()
+
     lines = ["<b>Расчетное время:</b>\n"]
-    for i, it in enumerate(window):
-        text = f"{it['name']} — {it['eta_str']}"
-        if it["is_key"]:
-            text = f"➡️ <b>{it['name']} — {it['eta_str']}</b>"
-        lines.append(text)
+    for item in window:
+        if item["is_key"]:
+            lines.append(f"➡️ <b>{item['name']} — {item['eta_str']}</b>")
+        else:
+            lines.append(f"{item['name']} — {item['eta_str']}")
+
     lines.append("")
-    lines.append(f"Точность прогноза: {conf}%")
+    lines.append(f"Точность прогноза: {confidence}%")
     lines.append(f"Ситуация: {status}")
 
-    kb = main_menu_builder()
-    msg = await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup())
-    await register_buttons_message_async(msg.chat.id, msg.message_id)
+    text = "\n".join(lines)
+    await send_with_main_menu_from_callback(callback, text)
     await callback.answer()
+
 
 @dp.callback_query(F.data == "press")
-async def cb_press(callback: CallbackQuery):
-    # store pressed time now (UTC)
-    now_ts = int(datetime.utcnow().timestamp())
-    uid = callback.from_user.id
-    expiry = now_ts + SESSION_TTL
-    PRESSED_SESSIONS[uid] = (now_ts, expiry)
-    # show stops keyboard
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s["name"], callback_data=f"stop_{s['id']}")] for s in SCHEDULE])
-    msg = await callback.message.answer(f"Отметка времени зафиксирована: <b>{datetime.utcfromtimestamp(now_ts).strftime('%H:%M:%S')}</b>\nВыберите остановку:", reply_markup=kb)
-    await register_buttons_message_async(msg.chat.id, msg.message_id)
+async def on_press(callback: CallbackQuery):
+    """
+    Нажата кнопка «Отметить прибытие».
+    Фиксируем время нажатия, затем просим выбрать остановку.
+    """
+    user_id = callback.from_user.id
+    now_ts = int(now_local().timestamp())
+    expiry_ts = now_ts + SESSION_TTL
+    PRESSED_SESSIONS[user_id] = (now_ts, expiry_ts)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=s["name"], callback_data=f"stop_{s['id']}")]
+            for s in SCHEDULE
+        ]
+    )
+
+    human_time = datetime.fromtimestamp(now_ts).strftime("%H:%M:%S")
+    msg = await callback.message.answer(
+        f"Отметка времени зафиксирована: <b>{human_time}</b>.\nВыберите остановку:",
+        reply_markup=kb,
+    )
+    await register_buttons_message(msg.chat.id, msg.message_id)
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("stop_"))
-async def cb_stop(callback: CallbackQuery):
-    uid = callback.from_user.id
-    session = PRESSED_SESSIONS.get(uid)
+async def on_stop(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    session = PRESSED_SESSIONS.get(user_id)
     if not session:
-        kb = main_menu_builder()
-        msg = await callback.message.answer("Сессия истекла или отсутствует. Нажмите «🚌 Отметить прибытие» и повторите.", reply_markup=kb.as_markup())
-        await register_buttons_message_async(msg.chat.id, msg.message_id)
-        await callback.answer()
-        return
-    pressed_ts, expiry = session
-    if int(datetime.utcnow().timestamp()) > expiry:
-        PRESSED_SESSIONS.pop(uid, None)
-        kb = main_menu_builder()
-        msg = await callback.message.answer("Сессия устарела. Пожалуйста, нажмите «🚌 Отметить прибытие» ещё раз.", reply_markup=kb.as_markup())
-        await register_buttons_message_async(msg.chat.id, msg.message_id)
+        await send_with_main_menu_from_callback(
+            callback,
+            "Сессия истекла или отсутствует. Нажмите «🚌 Отметить прибытие» и повторите.",
+        )
         await callback.answer()
         return
 
-    # use pressed_ts as the event time
-    stop_id = int(callback.data.split("_",1)[1])
-    add_event(stop_id, pressed_ts, uid)
-    # cleanup session
-    PRESSED_SESSIONS.pop(uid, None)
+    pressed_ts, expiry_ts = session
+    now_ts = int(now_local().timestamp())
+    if now_ts > expiry_ts:
+        PRESSED_SESSIONS.pop(user_id, None)
+        await send_with_main_menu_from_callback(
+            callback,
+            "Сессия устарела. Пожалуйста, нажмите «🚌 Отметить прибытие» ещё раз.",
+        )
+        await callback.answer()
+        return
 
-    # human time in local-ish format (UTC shown)
-    human_time = datetime.utcfromtimestamp(pressed_ts).strftime("%H:%M:%S")
-    # compute deviation vs schedule for that stop
+    stop_id = int(callback.data.split("_", 1)[1])
+
+    add_event(stop_id, pressed_ts, user_id)
+    PRESSED_SESSIONS.pop(user_id, None)
+
     sched_map = schedule_map_dt()
     sched_dt = sched_map.get(stop_id)
-    delta_min = int(round((pressed_ts - int(sched_dt.timestamp()))/60.0)) if sched_dt else 0
+    if sched_dt is not None:
+        delta_min = int(round((pressed_ts - int(sched_dt.timestamp())) / 60.0))
+    else:
+        delta_min = 0
 
-    # Save convenience last state in state.json for UI (optional)
-    st = load_state()
-    st["last_stop"] = stop_id
-    st["last_time"] = pressed_ts
-    save_state(st)
-
-    # Friendly message (like v0.1)
     stop_name = next(s["name"] for s in SCHEDULE if s["id"] == stop_id)
-    text = f"Спасибо! Автобус отмечен на остановке <b>{stop_name}</b> в <b>{human_time}</b>.\nОтклонение от расписания: <b>{delta_min:+} мин.</b>"
+    human_time = datetime.fromtimestamp(pressed_ts).strftime("%H:%M:%S")
 
-    kb = main_menu_builder()
-    msg = await callback.message.answer(text, reply_markup=kb.as_markup())
-    await register_buttons_message_async(msg.chat.id, msg.message_id)
+    text = (
+        f"Спасибо! Автобус отмечен на остановке <b>{stop_name}</b> "
+        f"в <b>{human_time}</b>.\n"
+        f"Отклонение от расписания: <b>{delta_min:+} мин.</b>"
+    )
+
+    await send_with_main_menu_from_callback(callback, text)
     await callback.answer()
 
-# ---------------- Startup ----------------
-if __name__ == "__main__":
+
+# ------------- Запуск -------------
+async def main():
     init_db()
-    # ensure state file exists
-    if not os.path.exists(STATE_FILE):
-        save_state({})
-    print("Transport bot v0.3 started.")
-    asyncio.run(dp.start_polling(bot))
+    print("Transport bot v0.3.2 started (local time).")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
