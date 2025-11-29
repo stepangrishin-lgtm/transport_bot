@@ -11,8 +11,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -24,7 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = "8598055235:AAEcMaVgBkiKYokFXxDd2_govw4ytGp8Rn4"  # <<< ВСТАВЬ СВОЙ ТОКЕН
 ADMIN_ID = 331165172  # твой Telegram ID
 
-SCHEDULE_FILE = "schedule.json"
+ROUTES_FILE = "routes.json"
 DB_FILE = "transport.db"
 
 SESSION_TTL = 180        # 3 минуты — время жизни сессии отметки
@@ -33,8 +31,8 @@ MIN_SEGMENT_MIN = 1      # минимальное время между сосе
 EMA_ALPHA = 0.5          # коэффициент сглаживания EMA
 MIDNIGHT_CHECK_INTERVAL = 10800  # 3 часа, сек
 
-LAST_BUTTON_MESSAGES: List[Tuple[int, int]] = []
-PRESSED_SESSIONS: Dict[int, Tuple[int, int, str]] = {}
+# user_id -> (pressed_m, expiry_m, day, route_id)
+PRESSED_SESSIONS: Dict[int, Tuple[int, int, str, str]] = {}
 
 bot = Bot(
     BOT_TOKEN,
@@ -68,25 +66,50 @@ def human_time_from_minute(m: int) -> str:
 
 
 # -------------------------------------------------------------------
-# SCHEDULE
+# ROUTES / SCHEDULES
 # -------------------------------------------------------------------
 
-def load_schedule():
-    if not os.path.exists(SCHEDULE_FILE):
-        raise RuntimeError("schedule.json not found")
+def load_routes():
+    if not os.path.exists(ROUTES_FILE):
+        raise RuntimeError("routes.json not found")
 
-    with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+    with open(ROUTES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    stops = data["stops"]
-    for s in stops:
-        s["id"] = int(s["id"])
-        hh, mm = map(int, s["time"].split(":"))
-        s["minute"] = hh * 60 + mm
-    return stops
+    routes_dict: Dict[str, Dict] = {}
+    for r in data.get("routes", []):
+        rid = r["id"]
+        name = r["name"]
+        stops = r["stops"]
+        # добавляем поле minute в каждую остановку
+        for s in stops:
+            t = s["time"]
+            hh, mm = map(int, t.split(":"))
+            s["minute"] = hh * 60 + mm
+            s["id"] = int(s["id"])
+        routes_dict[rid] = {
+            "id": rid,
+            "name": name,
+            "stops": stops,
+        }
+    return routes_dict
 
 
-SCHEDULE = load_schedule()
+ROUTES: Dict[str, Dict] = load_routes()  # route_id -> {id, name, stops}
+
+
+def get_route(route_id: str) -> Optional[Dict]:
+    return ROUTES.get(route_id)
+
+
+def list_routes_ordered() -> List[Dict]:
+    # упорядочим по id M1, M2, ... если возможно
+    def sort_key(r):
+        rid = r["id"]
+        if rid.startswith("M") and rid[1:].isdigit():
+            return int(rid[1:])
+        return 9999
+    return sorted(ROUTES.values(), key=sort_key)
 
 
 # -------------------------------------------------------------------
@@ -98,54 +121,96 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
+    # события
     cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             day TEXT NOT NULL,
+            route_id TEXT NOT NULL,
             stop_id INTEGER NOT NULL,
             minute INTEGER NOT NULL,
             user_id INTEGER
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_day ON events(day)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_day_stop ON events(day, stop_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_day_minute ON events(day, minute)")
+
+    # настройки пользователей (выбор маршрута)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            route_id TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_day_route ON events(day, route_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_day_route_stop ON events(day, route_id, stop_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_route_minute ON events(route_id, minute)")
 
     conn.commit()
     conn.close()
     return fresh
 
 
-def add_event(day: str, stop_id: int, minute: int, user_id: Optional[int]):
+def add_event(day: str, route_id: str, stop_id: int, minute: int, user_id: Optional[int]):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO events (day, stop_id, minute, user_id) VALUES (?, ?, ?, ?)",
-        (day, stop_id, minute, user_id),
+        "INSERT INTO events (day, route_id, stop_id, minute, user_id) VALUES (?, ?, ?, ?, ?)",
+        (day, route_id, stop_id, minute, user_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_today_events() -> List[Tuple[int, int]]:
-    """Вернёт (stop_id, minute) за сегодня."""
+def get_today_events(route_id: str) -> List[Tuple[int, int]]:
+    """Вернёт (stop_id, minute) за сегодня по конкретному маршруту."""
     day = today_str()
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "SELECT stop_id, minute FROM events WHERE day = ? ORDER BY minute ASC",
-        (day,),
+        "SELECT stop_id, minute FROM events WHERE day = ? AND route_id = ? ORDER BY minute ASC",
+        (day, route_id),
     )
     rows = cur.fetchall()
     conn.close()
     return [(int(sid), int(m)) for sid, m in rows]
 
 
-def get_events_by_stop_today() -> Dict[int, List[int]]:
+def get_events_by_stop_today(route_id: str) -> Dict[int, List[int]]:
     out: Dict[int, List[int]] = {}
-    for sid, m in get_today_events():
+    for sid, m in get_today_events(route_id):
         out.setdefault(sid, []).append(m)
     return out
+
+
+# -------------------------------------------------------------------
+# USER SETTINGS (ROUTE CHOICE)
+# -------------------------------------------------------------------
+
+def get_user_route_id(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT route_id FROM user_settings WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+
+def set_user_route_id(user_id: int, route_id: str):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO user_settings (user_id, route_id) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET route_id = excluded.route_id",
+        (user_id, route_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
 # -------------------------------------------------------------------
@@ -160,50 +225,53 @@ def main_menu():
     return kb.as_markup()
 
 
-async def register_buttons_message(chat_id: int, message_id: int):
-    """
-    Держим кнопки только у двух последних сообщений.
-    """
-    global LAST_BUTTON_MESSAGES
-    LAST_BUTTON_MESSAGES.append((chat_id, message_id))
-
-    while len(LAST_BUTTON_MESSAGES) > 2:
-        old_chat, old_msg = LAST_BUTTON_MESSAGES.pop(0)
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=old_chat,
-                message_id=old_msg,
-                reply_markup=None,
-            )
-        except:
-            pass
+def routes_keyboard():
+    kb = InlineKeyboardBuilder()
+    for r in list_routes_ordered():
+        kb.button(text=r["name"], callback_data=f"route_{r['id']}")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 async def answer_with_menu(message: Message, text: str):
-    msg = await message.answer(text, reply_markup=main_menu())
-    await register_buttons_message(msg.chat.id, msg.message_id)
+    await message.answer(text, reply_markup=main_menu())
 
 
 async def callback_answer_with_menu(callback: CallbackQuery, text: str):
-    msg = await callback.message.answer(text, reply_markup=main_menu())
-    await register_buttons_message(msg.chat.id, msg.message_id)
+    await callback.message.answer(text, reply_markup=main_menu())
+
+
+async def ask_route_select_message(message: Message):
+    await message.answer(
+        "🚍 Выберите ваш маршрут:",
+        reply_markup=routes_keyboard()
+    )
+
+
+async def ask_route_select_callback(callback: CallbackQuery):
+    await callback.message.answer(
+        "🚍 Выберите ваш маршрут:",
+        reply_markup=routes_keyboard()
+    )
 
 
 # -------------------------------------------------------------------
-# CORE COMPUTATION (0.5 LOGIC)
+# CORE COMPUTATION (PER ROUTE)
 # -------------------------------------------------------------------
 
-def compute_clean_means_by_stop():
+def compute_clean_means_by_stop(route_id: str):
     """
-    Фильтрация выбросов (по MAX_DELTA_MIN) и среднее время прибытия по каждой остановке.
-    Возвращает:
-      means: stop_id -> avg_minute
-      total_used: количество учтённых отметок
-      latest_minute: минута последней учтённой отметки
-      latest_stop: её остановка
+    Фильтрация выбросов и среднее время прибытия по каждой остановке
+    для конкретного маршрута.
     """
-    events = get_events_by_stop_today()
-    plan = {s["id"]: s["minute"] for s in SCHEDULE}
+    route = get_route(route_id)
+    if not route:
+        return {}, 0, None, None
+
+    schedule = route["stops"]
+    plan = {s["id"]: s["minute"] for s in schedule}
+
+    events = get_events_by_stop_today(route_id)
     means: Dict[int, float] = {}
     total_used = 0
     latest_minute = None
@@ -229,23 +297,21 @@ def compute_clean_means_by_stop():
     return means, total_used, latest_minute, latest_stop
 
 
-def build_eta_with_segments_and_ema():
+def build_eta_with_segments_and_ema(route_id: str):
     """
-    Сегментная модель + EMA сглаживание по маршруту.
-    Возвращает:
-      eta_final: stop_id -> eta_minute
-      conf: int
-      status_text: str
-      latest_minute: Optional[int]
-      latest_stop: Optional[int]
-      avg_off: float (среднее смещение)
+    Сегментная модель + EMA для одного маршрута.
     """
-    means, total_used, latest_minute, latest_stop = compute_clean_means_by_stop()
-    plan = {s["id"]: s["minute"] for s in SCHEDULE}
-    ids = [s["id"] for s in SCHEDULE]
+    route = get_route(route_id)
+    if not route:
+        return {}, 0, "маршрут не найден", None, None, 0.0
+
+    schedule = route["stops"]
+    plan = {s["id"]: s["minute"] for s in schedule}
+    ids = [s["id"] for s in schedule]
+
+    means, total_used, latest_minute, latest_stop = compute_clean_means_by_stop(route_id)
 
     if not means:
-        # Нет данных — идём по расписанию
         eta_map = {sid: float(plan[sid]) for sid in ids}
         return eta_map, 40, "нет данных — автобус по расписанию", None, None, 0.0
 
@@ -273,7 +339,7 @@ def build_eta_with_segments_and_ema():
             if diff >= MIN_SEGMENT_MIN:
                 seg_fact[(a, b)] = int(round(diff))
 
-    # Распространяем ETA вперёд/назад
+    # распространение ETA вперёд/назад
     changed = True
     while changed:
         changed = False
@@ -291,7 +357,7 @@ def build_eta_with_segments_and_ema():
         if sid not in eta_raw:
             eta_raw[sid] = float(plan[sid])
 
-    # Смещения и EMA
+    # смещения и EMA
     offsets = {sid: eta_raw[sid] - plan[sid] for sid in ids}
     ema_offsets: Dict[int, float] = {}
     ema: Optional[float] = None
@@ -316,12 +382,18 @@ def build_eta_with_segments_and_ema():
     return eta_final, conf, status, latest_minute, latest_stop, avg_off
 
 
-def build_eta_window():
+def build_eta_window(route_id: str):
     """
-    Собирает окно из 5 остановок вокруг ключевой, плюс статус и последнюю отметку.
+    Окно из 5 остановок вокруг ключевой для конкретного маршрута.
     """
-    eta_map, conf, status, latest_minute, latest_stop, avg_off = build_eta_with_segments_and_ema()
-    ids = [s["id"] for s in SCHEDULE]
+    route = get_route(route_id)
+    if not route:
+        return [], 0, "маршрут не найден", None, None, 0.0
+
+    schedule = route["stops"]
+    eta_map, conf, status, latest_minute, latest_stop, avg_off = build_eta_with_segments_and_ema(route_id)
+
+    ids = [s["id"] for s in schedule]
     now_m = now_minute_of_day()
 
     diffs = [(sid, abs(eta_map[sid] - now_m)) for sid in ids]
@@ -338,7 +410,7 @@ def build_eta_window():
 
     window = []
     for sid in chosen:
-        stop = next(s for s in SCHEDULE if s["id"] == sid)
+        stop = next(s for s in schedule if s["id"] == sid)
         eta_minute = eta_map[sid]
         window.append({
             "id": sid,
@@ -351,7 +423,7 @@ def build_eta_window():
 
 
 # -------------------------------------------------------------------
-# AUTO RESET AT MIDNIGHT (CHECK EVERY 3 HOURS)
+# AUTO RESET AT MIDNIGHT
 # -------------------------------------------------------------------
 
 LAST_RESET_DAY = today_str()
@@ -361,7 +433,6 @@ async def auto_reset_daily():
     while True:
         now_day = today_str()
         if now_day != LAST_RESET_DAY:
-            # День сменился — очищаем все события
             conn = sqlite3.connect(DB_FILE)
             cur = conn.cursor()
             cur.execute("DELETE FROM events")
@@ -375,144 +446,28 @@ async def auto_reset_daily():
 
 
 # -------------------------------------------------------------------
-# ADMIN HELPERS
-# -------------------------------------------------------------------
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-
-# -------------------------------------------------------------------
-# HANDLERS: START / WHERE / PRESS / ALL_STOPS / STOP
+# HANDLERS
 # -------------------------------------------------------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await answer_with_menu(message, "Привет! Бот транспорта (v0.6).\nВыберите действие:")
+    user_id = message.from_user.id
+    route_id = get_user_route_id(user_id)
 
-
-@dp.callback_query(F.data == "where")
-async def on_where(callback: CallbackQuery):
-    window, conf, status, latest_minute, latest_stop, avg_off = build_eta_window()
-
-    lines: List[str] = []
-
-    # Блок "последняя отметка"
-    if latest_minute is not None and latest_stop is not None:
-        stop_name = next(s["name"] for s in SCHEDULE if s["id"] == latest_stop)
-        lines.append(
-            f"📍 Последняя отметка: <b>{stop_name}</b> — <b>{human_time_from_minute(latest_minute)}</b>\n"
+    if route_id and get_route(route_id):
+        route_name = get_route(route_id)["name"]
+        await answer_with_menu(
+            message,
+            f"🚍 Ваш маршрут: <b>{route_name}</b>\nВыберите действие:"
         )
     else:
-        lines.append("Нет отметок за сегодня.\n")
-
-    lines.append("<b>Расчетное время:</b>\n")
-
-    for w in window:
-        if w["is_key"]:
-            lines.append(f"➡️ <b>{w['name']} — {w['eta_str']}</b>")
-        else:
-            lines.append(f"{w['name']} — {w['eta_str']}")
-
-    # Эмодзи статуса
-    if avg_off > 1.5:
-        emoji = "🟥"
-    elif avg_off < -1.5:
-        emoji = "🟨"
-    else:
-        emoji = "🟩"
-
-    lines.append("")
-    lines.append(f"Точность прогноза: {conf}%")
-    lines.append(f"Ситуация: {emoji} {status}")
-
-    await callback_answer_with_menu(callback, "\n".join(lines))
-    await callback.answer()
+        await ask_route_select_message(message)
 
 
-@dp.callback_query(F.data == "press")
-async def on_press(callback: CallbackQuery):
-    """
-    Нажата «Отметить прибытие» — фиксируем время и предлагаем TOP-5 остановок.
-    """
-    now_m = now_minute_of_day()
-    day = today_str()
-    expiry_m = now_m + (SESSION_TTL // 60) + 1
+@dp.message(Command("change_route"))
+async def cmd_change_route(message: Message):
+    await ask_route_select_message(message)
 
-    PRESSED_SESSIONS[callback.from_user.id] = (now_m, expiry_m, day)
-
-    # TOP-5 ближайших остановок
-    diffs = [(s["id"], abs(s["minute"] - now_m)) for s in SCHEDULE]
-    diffs.sort(key=lambda x: x[1])
-    top_ids = [sid for sid, _ in diffs[:5]]
-
-    kb = InlineKeyboardBuilder()
-    for s in SCHEDULE:
-        if s["id"] in top_ids:
-            kb.button(text=s["name"], callback_data=f"stop_{s['id']}")
-    kb.button(text="Показать все остановки", callback_data="all_stops")
-    kb.adjust(1)
-
-    msg = await callback.message.answer("Выберите остановку:", reply_markup=kb.as_markup())
-    await register_buttons_message(msg.chat.id, msg.message_id)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "all_stops")
-async def on_all_stops(callback: CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    for s in SCHEDULE:
-        kb.button(text=s["name"], callback_data=f"stop_{s['id']}")
-    kb.adjust(1)
-
-    msg = await callback.message.answer("Полный список остановок:", reply_markup=kb.as_markup())
-    await register_buttons_message(msg.chat.id, msg.message_id)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("stop_"))
-async def on_stop(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = PRESSED_SESSIONS.get(user_id)
-
-    if not session:
-        await callback_answer_with_menu(callback, "Сессия истекла. Повторите отметку.")
-        await callback.answer()
-        return
-
-    pressed_m, expiry_m, day = session
-    now_m = now_minute_of_day()
-
-    if now_m > expiry_m:
-        PRESSED_SESSIONS.pop(user_id, None)
-        await callback_answer_with_menu(callback, "Сессия устарела. Повторите отметку.")
-        await callback.answer()
-        return
-
-    stop_id = int(callback.data.split("_")[1])
-    PRESSED_SESSIONS.pop(user_id, None)
-
-    add_event(day, stop_id, pressed_m, user_id)
-
-    plan_min = next(s["minute"] for s in SCHEDULE if s["id"] == stop_id)
-    delta = pressed_m - plan_min
-
-    stop_name = next(s["name"] for s in SCHEDULE if s["id"] == stop_id)
-    human = human_time_from_minute(pressed_m)
-
-    text = (
-        f"Спасибо! Автобус отмечен на остановке <b>{stop_name}</b> "
-        f"в <b>{human}</b>.\n"
-        f"Отклонение от расписания: <b>{delta:+} мин.</b>"
-    )
-
-    await callback_answer_with_menu(callback, text)
-    await callback.answer()
-
-
-# -------------------------------------------------------------------
-# ADMIN COMMANDS: /stats_today, /reset_now
-# -------------------------------------------------------------------
 
 @dp.message(Command("stats_today"))
 async def cmd_stats_today(message: Message):
@@ -520,20 +475,32 @@ async def cmd_stats_today(message: Message):
         await message.answer("⛔ У вас нет доступа к этой команде.")
         return
 
-    events = get_today_events()
-    if not events:
-        await answer_with_menu(message, "📊 Статистика за сегодня:\nОтметок за сегодня нет.")
+    route_id = get_user_route_id(message.from_user.id)
+    if not route_id or not get_route(route_id):
+        await message.answer("Сначала выберите маршрут командой /change_route.")
         return
 
-    plan = {s["id"]: s["minute"] for s in SCHEDULE}
+    events = get_today_events(route_id)
+    if not events:
+        await answer_with_menu(
+            message,
+            f"📊 Статистика за сегодня ({get_route(route_id)['name']}):\nОтметок за сегодня нет."
+        )
+        return
+
+    schedule = get_route(route_id)["stops"]
+    plan = {s["id"]: s["minute"] for s in schedule}
+
     offsets: List[int] = []
     for sid, m in events:
         if sid in plan:
             offsets.append(m - plan[sid])
 
     if not offsets:
-        # на всякий случай, если все события не сопоставимы с расписанием
-        await answer_with_menu(message, "📊 Статистика за сегодня:\nДанные есть, но не удалось сопоставить с расписанием.")
+        await answer_with_menu(
+            message,
+            "📊 Статистика за сегодня:\nДанные есть, но не удалось сопоставить с расписанием."
+        )
         return
 
     total = len(offsets)
@@ -543,11 +510,11 @@ async def cmd_stats_today(message: Message):
     max_off = max(offsets)
 
     last_sid, last_minute = events[-1]
-    last_stop_name = next(s["name"] for s in SCHEDULE if s["id"] == last_sid)
+    last_stop_name = next(s["name"] for s in schedule if s["id"] == last_sid)
     last_time = human_time_from_minute(last_minute)
 
     lines = [
-        "📊 Статистика за сегодня:",
+        f"📊 Статистика за сегодня ({get_route(route_id)['name']}):",
         f"• Отметок: {len(events)}",
         f"• Уникальных остановок: {unique_stops}",
         f"• Среднее отклонение: {avg_off:+.1f} мин",
@@ -571,7 +538,190 @@ async def cmd_reset_now(message: Message):
     conn.commit()
     conn.close()
 
-    await answer_with_menu(message, "🗑 Данные по отметкам очищены (все дни).")
+    await answer_with_menu(message, "🗑 Данные по отметкам очищены (все маршруты, все дни).")
+
+
+@dp.callback_query(F.data.startswith("route_"))
+async def on_route_select(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    route_id = callback.data.split("_", 1)[1]
+
+    if not get_route(route_id):
+        await callback.answer("Маршрут не найден.", show_alert=True)
+        return
+
+    set_user_route_id(user_id, route_id)
+    route_name = get_route(route_id)["name"]
+    await callback.message.answer(
+        f"Маршрут выбран: <b>{route_name}</b>.\nТеперь вы можете пользоваться кнопками ниже.",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "where")
+async def on_where(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    route_id = get_user_route_id(user_id)
+
+    if not route_id or not get_route(route_id):
+        await ask_route_select_callback(callback)
+        await callback.answer()
+        return
+
+    route = get_route(route_id)
+    window, conf, status, latest_minute, latest_stop, avg_off = build_eta_window(route_id)
+
+    lines: List[str] = []
+    lines.append(f"Маршрут: <b>{route['name']}</b>\n")
+
+    if latest_minute is not None and latest_stop is not None:
+        schedule = route["stops"]
+        stop_name = next(s["name"] for s in schedule if s["id"] == latest_stop)
+        lines.append(
+            f"📍 Последняя отметка: <b>{stop_name}</b> — <b>{human_time_from_minute(latest_minute)}</b>\n"
+        )
+    else:
+        lines.append("Нет отметок за сегодня.\n")
+
+    lines.append("<b>Расчетное время:</b>\n")
+
+    for w in window:
+        if w["is_key"]:
+            lines.append(f"➡️ <b>{w['name']} — {w['eta_str']}</b>")
+        else:
+            lines.append(f"{w['name']} — {w['eta_str']}")
+
+    if avg_off > 1.5:
+        emoji = "🟥"
+    elif avg_off < -1.5:
+        emoji = "🟨"
+    else:
+        emoji = "🟩"
+
+    lines.append("")
+    lines.append(f"Точность прогноза: {conf}%")
+    lines.append(f"Ситуация: {emoji} {status}")
+
+    await callback_answer_with_menu(callback, "\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "press")
+async def on_press(callback: CallbackQuery):
+    """
+    «Отметить прибытие» — фиксируем время и предлагаем TOP-5 остановок маршрута.
+    """
+    user_id = callback.from_user.id
+    route_id = get_user_route_id(user_id)
+
+    if not route_id or not get_route(route_id):
+        await ask_route_select_callback(callback)
+        await callback.answer()
+        return
+
+    route = get_route(route_id)
+    schedule = route["stops"]
+
+    now_m = now_minute_of_day()
+    day = today_str()
+    expiry_m = now_m + (SESSION_TTL // 60) + 1
+
+    PRESSED_SESSIONS[user_id] = (now_m, expiry_m, day, route_id)
+
+    # TOP-5 ближайших остановок по времени расписания
+    diffs = [(s["id"], abs(s["minute"] - now_m)) for s in schedule]
+    diffs.sort(key=lambda x: x[1])
+    top_ids = [sid for sid, _ in diffs[:5]]
+
+    kb = InlineKeyboardBuilder()
+    for s in schedule:
+        if s["id"] in top_ids:
+            kb.button(text=s["name"], callback_data=f"stop_{s['id']}")
+    kb.button(text="Показать все остановки", callback_data="all_stops")
+    kb.adjust(1)
+
+    await callback.message.answer("Выберите остановку:", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "all_stops")
+async def on_all_stops(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    session = PRESSED_SESSIONS.get(user_id)
+
+    if not session:
+        await callback_answer_with_menu(callback, "Сессия истекла. Нажмите «🚌 Отметить прибытие» ещё раз.")
+        await callback.answer()
+        return
+
+    _, _, _, route_id = session
+    route = get_route(route_id)
+    if not route:
+        await callback_answer_with_menu(callback, "Маршрут не найден. Попробуйте снова.")
+        await callback.answer()
+        return
+
+    schedule = route["stops"]
+
+    kb = InlineKeyboardBuilder()
+    for s in schedule:
+        kb.button(text=s["name"], callback_data=f"stop_{s['id']}")
+    kb.adjust(1)
+
+    await callback.message.answer("Полный список остановок:", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stop_"))
+async def on_stop(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    session = PRESSED_SESSIONS.get(user_id)
+
+    if not session:
+        await callback_answer_with_menu(callback, "Сессия истекла. Повторите отметку.")
+        await callback.answer()
+        return
+
+    pressed_m, expiry_m, day, route_id = session
+    now_m = now_minute_of_day()
+
+    if now_m > expiry_m:
+        PRESSED_SESSIONS.pop(user_id, None)
+        await callback_answer_with_menu(callback, "Сессия устарела. Повторите отметку.")
+        await callback.answer()
+        return
+
+    route = get_route(route_id)
+    if not route:
+        PRESSED_SESSIONS.pop(user_id, None)
+        await callback_answer_with_menu(callback, "Маршрут не найден. Повторите отметку.")
+        await callback.answer()
+        return
+
+    schedule = route["stops"]
+
+    stop_id = int(callback.data.split("_")[1])
+    PRESSED_SESSIONS.pop(user_id, None)
+
+    plan_min = next(s["minute"] for s in schedule if s["id"] == stop_id)
+    delta = pressed_m - plan_min
+
+    stop_name = next(s["name"] for s in schedule if s["id"] == stop_id)
+    human = human_time_from_minute(pressed_m)
+
+    # сохраняем событие
+    add_event(day, route_id, stop_id, pressed_m, user_id)
+
+    text = (
+        f"Спасибо! Автобус отмечен на маршруте <b>{route['name']}</b>\n"
+        f"Остановка: <b>{stop_name}</b>\n"
+        f"Время: <b>{human}</b>\n"
+        f"Отклонение от расписания: <b>{delta:+} мин.</b>"
+    )
+
+    await callback_answer_with_menu(callback, text)
+    await callback.answer()
 
 
 # -------------------------------------------------------------------
@@ -580,9 +730,8 @@ async def cmd_reset_now(message: Message):
 
 async def main():
     init_db()
-    # запускаем фоновый авто-сброс
     asyncio.create_task(auto_reset_daily())
-    print("Transport bot 0.6 started.")
+    print("Transport bot 1.0 (multi-route) started.")
     await dp.start_polling(bot)
 
 
