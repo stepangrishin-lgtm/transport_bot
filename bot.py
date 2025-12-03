@@ -2,16 +2,13 @@ import os
 import json
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-)
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -34,6 +31,9 @@ MIDNIGHT_CHECK_INTERVAL = 10800  # 3 часа, сек
 # user_id -> (pressed_m, expiry_m, day, route_id)
 PRESSED_SESSIONS: Dict[int, Tuple[int, int, str, str]] = {}
 
+# Жёстко задаём московский часовой пояс (UTC+3), чтобы не зависеть от настроек сервера
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
 bot = Bot(
     BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -46,7 +46,8 @@ dp = Dispatcher()
 # -------------------------------------------------------------------
 
 def now_local() -> datetime:
-    return datetime.now()
+    # Всегда возвращаем время в московском часовом поясе
+    return datetime.now(MOSCOW_TZ)
 
 
 def today_str() -> str:
@@ -731,7 +732,7 @@ async def on_stop(callback: CallbackQuery):
 async def main():
     init_db()
     asyncio.create_task(auto_reset_daily())
-    print("Transport bot 1.0 (multi-route) started.")
+    print("Transport bot 1.0.1 (multi-route, UTC+3 fixed) started.")
     await dp.start_polling(bot)
 
 
