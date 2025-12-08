@@ -512,23 +512,83 @@ def build_eta_with_segments_and_ema(route_id: str):
 
 def build_eta_window(route_id: str):
     """
-    Окно из 5 остановок вокруг ключевой для конкретного маршрута.
+    Новая логика окна из 5 остановок:
+    
+    1) Если есть свежая отметка (<= 12 мин):
+        - ключевая = ближайшая "будущая" остановка по прогнозу
+          среди тех, что идут ВПЕРЁД после последней отметки.
+          
+    2) Если отметка устарела (> 12 мин) или отметок нет:
+        - ключевая = ближайшая будущая по ETA (ETA >= now).
+        - если таких нет — последняя остановка.
+        
+    Окно = ключевая ± 2 остановки по маршруту.
     """
+
     route = get_route(route_id)
     if not route:
         return [], 0, "маршрут не найден", None, None, 0.0
 
     schedule = route["stops"]
-    eta_map, conf, status, latest_minute, latest_stop, avg_off = build_eta_with_segments_and_ema(route_id)
-
     ids = [s["id"] for s in schedule]
+    id_to_index = {sid: i for i, sid in enumerate(ids)}
+
+    eta_map, conf, status, latest_minute, latest_stop, avg_off = build_eta_with_segments_and_ema(route_id)
     now_m = now_minute_of_day()
 
-    diffs = [(sid, abs(eta_map[sid] - now_m)) for sid in ids]
-    diffs.sort(key=lambda x: x[1])
-    key_sid = diffs[0][0]
+    # --------------------------------------------------------------
+    # 1. Если НЕТ отметок за сегодня → используем чистый ETA выбор
+    # --------------------------------------------------------------
+    if latest_stop is None:
+        # Берём ближайшую будущую ETA
+        future = [(sid, eta_map[sid]) for sid in ids if eta_map[sid] >= now_m]
+        if future:
+            key_sid, _ = min(future, key=lambda x: x[1])
+        else:
+            key_sid = ids[-1]  # автобус должен быть у конца маршрута
+            
+        key_index = id_to_index[key_sid]
 
-    key_index = ids.index(key_sid)
+    else:
+        # ----------------------------------------------------------
+        # 2. Есть отметка → проверяем свежая ли она
+        # ----------------------------------------------------------
+        age = now_m - latest_minute
+
+        if age <= 12:
+            # ------------------------------------------------------
+            # 2A. СВЕЖАЯ отметка → выбираем будущую остановку
+            # ------------------------------------------------------
+            last_idx = id_to_index[latest_stop]
+
+            # Кандидаты вперёд: остановки начиная с последней отмеченной
+            forward_ids = ids[last_idx:]
+
+            # Ищем среди них ближайшую будущую ETA (>= now)
+            future = [(sid, eta_map[sid]) for sid in forward_ids if eta_map[sid] >= now_m]
+
+            if future:
+                key_sid, _ = min(future, key=lambda x: x[1])
+            else:
+                key_sid = forward_ids[-1]   # автобус уже должен быть в конце этого участка
+
+            key_index = id_to_index[key_sid]
+
+        else:
+            # ------------------------------------------------------
+            # 2B. СТАРАЯ отметка → fallback к ETA-позиционированию
+            # ------------------------------------------------------
+            future = [(sid, eta_map[sid]) for sid in ids if eta_map[sid] >= now_m]
+            if future:
+                key_sid, _ = min(future, key=lambda x: x[1])
+            else:
+                key_sid = ids[-1]
+
+            key_index = id_to_index[key_sid]
+
+    # --------------------------------------------------------------
+    # 3. Формируем окно из 5 остановок вокруг ключевой
+    # --------------------------------------------------------------
     start = max(0, key_index - 2)
     end = min(len(ids), start + 5)
     if end - start < 5:
@@ -539,15 +599,16 @@ def build_eta_window(route_id: str):
     window = []
     for sid in chosen:
         stop = next(s for s in schedule if s["id"] == sid)
-        eta_minute = eta_map[sid]
+        eta_str = human_time_from_minute(int(round(eta_map[sid])))
         window.append({
             "id": sid,
             "name": stop["name"],
-            "eta_str": human_time_from_minute(int(round(eta_minute))),
-            "is_key": sid == key_sid,
+            "eta_str": eta_str,
+            "is_key": sid == key_sid
         })
 
     return window, conf, status, latest_minute, latest_stop, avg_off
+
 
 # -------------------------------------------------------------------
 # ROUTE STATE & SEGMENT STATS UPDATE
