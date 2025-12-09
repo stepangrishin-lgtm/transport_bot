@@ -25,10 +25,12 @@ DB_FILE = "transport.db"
 
 SESSION_TTL = 180        # 3 минуты — время жизни сессии отметки
 MAX_DELTA_MIN = 60       # макс. отклонение для нормальной отметки
+FIRST_EVENT_MAX_DELTA = 20  # макс. отклонение ПЕРВОЙ отметки за день, иначе не учитываем её в расчётах
 MIN_SEGMENT_MIN = 1      # минимальное время сегмента (мин)
 EMA_ALPHA = 0.5          # коэффициент сглаживания EMA
 MIDNIGHT_CHECK_INTERVAL = 10800  # 3 часа, сек
 SEGMENT_UPDATE_INTERVAL = 300    # 5 минут, сек
+
 
 # --- Уведомления о задержках ---
 DELAY_CHECK_INTERVAL = 180       # каждые 3 минуты проверяем задержки
@@ -326,6 +328,11 @@ async def ask_route_select_callback(callback: CallbackQuery):
 def compute_clean_means_by_stop(route_id: str):
     """
     Среднее время прибытия по каждой остановке (за сегодня) с фильтрацией выбросов.
+
+    Новое в 1.3.2:
+    - первая отметка за день проходит более жёсткий фильтр (FIRST_EVENT_MAX_DELTA),
+      чтобы кривая первая отметка не ломала весь прогноз;
+    - все остальные отметки фильтруются как раньше по MAX_DELTA_MIN.
     """
     route = get_route(route_id)
     if not route:
@@ -334,30 +341,51 @@ def compute_clean_means_by_stop(route_id: str):
     schedule = route["stops"]
     plan = {s["id"]: s["minute"] for s in schedule}
 
-    events = get_events_by_stop_today(route_id)
-    means: Dict[int, float] = {}
-    total_used = 0
-    latest_minute = None
-    latest_stop = None
+    # Берём сырые события за сегодня в порядке времени
+    raw_events = get_today_events(route_id)  # [(stop_id, minute), ...] отсортировано по minute
 
-    for sid, mins in events.items():
+    events_by_stop: Dict[int, List[int]] = {}
+    total_used = 0
+    latest_minute: Optional[int] = None
+    latest_stop: Optional[int] = None
+
+    anchor_checked = False  # уже проверяли первую отметку или нет
+
+    for sid, m in raw_events:
         if sid not in plan:
             continue
+
         pm = plan[sid]
-        filtered = [m for m in mins if abs(m - pm) <= MAX_DELTA_MIN]
-        if not filtered:
+        delta = m - pm
+
+        # --- специальная логика для ПЕРВОЙ отметки за день ---
+        if not anchor_checked:
+            anchor_checked = True
+            if abs(delta) > FIRST_EVENT_MAX_DELTA:
+                # первая отметка слишком далеко от расписания -> считаем мусором
+                continue
+
+        # --- обычная фильтрация выбросов для всех отметок ---
+        if abs(delta) > MAX_DELTA_MIN:
             continue
 
-        avg = sum(filtered) / len(filtered)
-        means[sid] = avg
-        total_used += len(filtered)
+        # отметка нормальная — учитываем
+        events_by_stop.setdefault(sid, []).append(m)
+        total_used += 1
 
-        for m in filtered:
-            if latest_minute is None or m > latest_minute:
-                latest_minute = m
-                latest_stop = sid
+        # обновляем "последнюю" нормальную отметку
+        if latest_minute is None or m > latest_minute:
+            latest_minute = m
+            latest_stop = sid
+
+    # считаем среднее по каждой остановке
+    means: Dict[int, float] = {}
+    for sid, mins in events_by_stop.items():
+        avg = sum(mins) / len(mins)
+        means[sid] = avg
 
     return means, total_used, latest_minute, latest_stop
+
 
 
 def load_segment_stats_for_route(route_id: str) -> Tuple[Dict[Tuple[int, int], float],
@@ -389,6 +417,11 @@ def load_segment_stats_for_route(route_id: str) -> Tuple[Dict[Tuple[int, int], f
 def build_eta_with_segments_and_ema(route_id: str):
     """
     Сегментная модель + история + критичные сегменты + EMA для одного маршрута.
+
+    Новое в 1.3.2:
+      - после расчёта ETA добавляем «якорь»:
+        если есть достаточно свежая последняя отметка, подравниваем хвост
+        маршрута так, чтобы на этой остановке прогноз совпал с реальным временем.
     """
     route = get_route(route_id)
     if not route:
@@ -498,6 +531,27 @@ def build_eta_with_segments_and_ema(route_id: str):
         ema_offsets[sid] = ema
 
     eta_final = {sid: plan[sid] + ema_offsets[sid] for sid in ids}
+
+    # ------------------------------------------------------------------
+    # ЯКОРЬ: притягиваем модель к последней СВЕЖЕЙ отметке
+    # ------------------------------------------------------------------
+    now_m = now_minute_of_day()
+    if latest_minute is not None and latest_stop is not None:
+        # считаем отметку «свежей», если она не старше 12 минут
+        if now_m - latest_minute <= 12:
+            try:
+                anchor_index = ids.index(latest_stop)
+                # насколько модель ошибается на последней отметке
+                anchor_delta = latest_minute - eta_final[latest_stop]
+
+                # если модель не «поехала» совсем (ограничим до 20 минут),
+                # то сдвигаем весь хвост маршрута после якоря.
+                if abs(anchor_delta) <= 20:
+                    for sid in ids[anchor_index:]:
+                        eta_final[sid] += anchor_delta
+            except ValueError:
+                # если latest_stop вдруг не в ids — просто пропускаем якорь
+                pass
 
     avg_off = sum(offsets.values()) / len(offsets)
     if avg_off > 1.5:
